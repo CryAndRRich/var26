@@ -26,7 +26,14 @@ def run(
     tagger: Optional[ConceptTagger] = None,
     mapper: Optional[CandidateMapper] = None,
     do_assertions: bool = True,
+    asserter=None,
 ) -> None:
+    """Ghép 3 module -> output/.
+    - tagger: ConceptTagger (EncoderTagger). None -> concept rỗng.
+    - asserter: object có .annotate(text, concepts) (vd LLMAsserter). None -> rule mặc định.
+    - mapper: CandidateMapper (RetrievalRerankMapper / LookupMapper).
+    """
+    annotate = asserter.annotate if asserter is not None else annotate_assertions
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     inputs = load_inputs(input_dir)
@@ -34,7 +41,7 @@ def run(
     for i, text in inputs.items():
         concepts: list[Concept] = tagger.tag(text) if tagger else []
         if do_assertions and concepts:
-            annotate_assertions(text, concepts)
+            annotate(text, concepts)
         if mapper:
             for c in concepts:
                 if c.type in TYPES_WITH_CANDIDATES:

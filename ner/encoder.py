@@ -14,37 +14,89 @@ from __future__ import annotations
 from ..io.schema import Concept, TYPES
 
 
-# ------------------------- Sơ đồ nhãn BIO -------------------------
-def build_labels() -> list[str]:
-    labels = ["O"]
-    for t in TYPES:
-        labels.append(f"B-{t}")
-        labels.append(f"I-{t}")
-    return labels
-
-
-LABELS = build_labels()
-LABEL2ID = {l: i for i, l in enumerate(LABELS)}
-ID2LABEL = {i: l for l, i in LABEL2ID.items()}
-O_ID = LABEL2ID["O"]
-
-
-# ------------------------- char spans -> token labels -------------------------
-def align_labels(offsets, spans, ignore_index: int = -100) -> list[int]:
-    """offsets: list (char_start, char_end) mỗi token (special token = (0,0)).
-    spans: list (start, end, type). Trả list nhãn id theo BIO; special token = ignore_index.
+# ------------------------- Sơ đồ nhãn BIO (tổng quát) -------------------------
+class LabelScheme:
+    """Sơ đồ BIO cho MỘT tập type bất kỳ. Dùng cho:
+      - EXP1/Stage B: tập 5 type cuộc thi (mặc định, xem COMPETITION bên dưới).
+      - EXP2/Stage A: tập type gốc của data ngoài (PhoNER/ViMQ) — khác hoàn toàn.
+    Tách scheme ra để pretrain 2 giai đoạn KHÔNG dạy nhầm nhãn (2 head khác nhau).
     """
-    labels = [ignore_index if cs == ce else O_ID for (cs, ce) in offsets]
-    for (s, e, t) in sorted(spans, key=lambda x: x[0]):
-        b_id, i_id = LABEL2ID[f"B-{t}"], LABEL2ID[f"I-{t}"]
-        first = True
-        for idx, (cs, ce) in enumerate(offsets):
-            if cs == ce:
+
+    def __init__(self, types):
+        self.types = list(types)
+        labels = ["O"]
+        for t in self.types:
+            labels.append(f"B-{t}")
+            labels.append(f"I-{t}")
+        self.labels = labels
+        self.label2id = {l: i for i, l in enumerate(labels)}
+        self.id2label = {i: l for l, i in self.label2id.items()}
+        self.o_id = self.label2id["O"]
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def align(self, offsets, spans, ignore_index: int = -100) -> list[int]:
+        """offsets: (char_start, char_end) mỗi token (special token = (0,0)).
+        spans: (start, end, type). Trả nhãn id BIO; special token = ignore_index.
+        Span có type NGOÀI scheme này bị bỏ qua (an toàn khi trộn nguồn)."""
+        labels = [ignore_index if cs == ce else self.o_id for (cs, ce) in offsets]
+        for (s, e, t) in sorted(spans, key=lambda x: x[0]):
+            if f"B-{t}" not in self.label2id:
                 continue
-            if cs < e and ce > s:  # token giao với span
-                labels[idx] = b_id if first else i_id
-                first = False
-    return labels
+            b_id, i_id = self.label2id[f"B-{t}"], self.label2id[f"I-{t}"]
+            first = True
+            for idx, (cs, ce) in enumerate(offsets):
+                if cs == ce:
+                    continue
+                if cs < e and ce > s:  # token giao với span
+                    labels[idx] = b_id if first else i_id
+                    first = False
+        return labels
+
+    def decode(self, text: str, offsets, label_ids) -> list[Concept]:
+        """Ghép run B/I liên tiếp cùng type -> Concept (theo id2label của scheme này)."""
+        return _decode_with(self.id2label, text, offsets, label_ids)
+
+
+# Scheme mặc định = 5 type cuộc thi. Giữ các tên cũ (LABELS, align_labels...) để
+# notebook EXP1 và code hiện tại không phải sửa.
+COMPETITION = LabelScheme(TYPES)
+
+
+def build_labels() -> list[str]:
+    return list(COMPETITION.labels)
+
+
+LABELS = COMPETITION.labels
+LABEL2ID = COMPETITION.label2id
+ID2LABEL = COMPETITION.id2label
+O_ID = COMPETITION.o_id
+
+
+def align_labels(offsets, spans, ignore_index: int = -100) -> list[int]:
+    """Alias tương thích ngược -> COMPETITION.align (5 type cuộc thi)."""
+    return COMPETITION.align(offsets, spans, ignore_index=ignore_index)
+
+
+# ------------------------- featurize (dùng chung notebook + external) -------------------------
+def build_features(examples, tok, scheme: "LabelScheme | None" = None,
+                   max_length: int = 256, stride: int = 64) -> list[dict]:
+    """examples: iterable (text, spans) với spans=[(start,end,type),...].
+    Trả list feature {input_ids, attention_mask, labels} (sliding-window).
+    CHỈ dùng tokenizer (CPU-safe) — vòng train đặt ở notebook."""
+    scheme = scheme or COMPETITION
+    feats: list[dict] = []
+    for text, spans in examples:
+        enc = tok(text, return_offsets_mapping=True, return_overflowing_tokens=True,
+                  max_length=max_length, stride=stride, truncation=True, padding=False)
+        for w in range(len(enc["input_ids"])):
+            feats.append({
+                "input_ids": enc["input_ids"][w],
+                "attention_mask": enc["attention_mask"][w],
+                "labels": scheme.align(enc["offset_mapping"][w], spans),
+            })
+    return feats
 
 
 # ------------------------- token labels -> char spans -------------------------
@@ -57,8 +109,8 @@ def _clean_span(text: str, s: int, e: int) -> tuple[int, int]:
     return s, e
 
 
-def decode_spans(text: str, offsets, label_ids) -> list[Concept]:
-    """Ghép run B/I liên tiếp cùng type -> Concept. offsets/label_ids theo thứ tự token."""
+def _decode_with(id2label: dict, text: str, offsets, label_ids) -> list[Concept]:
+    """Lõi decode BIO -> Concept theo bảng id2label truyền vào."""
     out: list[Concept] = []
     cur_type = None
     cur_s = cur_e = None
@@ -74,7 +126,7 @@ def decode_spans(text: str, offsets, label_ids) -> list[Concept]:
     for (cs, ce), lid in zip(offsets, label_ids):
         if cs == ce:  # special token
             continue
-        lab = ID2LABEL.get(int(lid), "O")
+        lab = id2label.get(int(lid), "O")
         if lab == "O":
             flush()
         elif lab.startswith("B-"):
@@ -90,6 +142,11 @@ def decode_spans(text: str, offsets, label_ids) -> list[Concept]:
                 cur_type, cur_s, cur_e = t, cs, ce
     flush()
     return out
+
+
+def decode_spans(text: str, offsets, label_ids) -> list[Concept]:
+    """Decode theo scheme cuộc thi (tương thích ngược)."""
+    return _decode_with(ID2LABEL, text, offsets, label_ids)
 
 
 # ------------------------- Tagger inference -------------------------
@@ -109,6 +166,10 @@ class EncoderTagger:
         self.model.eval()
         self.max_length = max_length
         self.stride = stride
+        # decode theo id2label của chính model (khớp scheme đã train, kể cả model
+        # Stage A có tập type khác). Ép key int cho chắc.
+        cfg = getattr(model, "config", None)
+        self.id2label = {int(k): v for k, v in cfg.id2label.items()} if cfg and getattr(cfg, "id2label", None) else ID2LABEL
 
     @classmethod
     def from_pretrained(cls, path, **kw):
@@ -152,4 +213,4 @@ class EncoderTagger:
         order.sort()
         offsets = order
         label_ids = [by_offset[k] for k in order]
-        return decode_spans(text, offsets, label_ids)
+        return _decode_with(self.id2label, text, offsets, label_ids)
