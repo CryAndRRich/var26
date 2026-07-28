@@ -35,6 +35,15 @@ SYSTEM_PROMPT = (
     'Trả lời DUY NHẤT một mảng JSON, ví dụ: ["isNegated"] hoặc [].'
 )
 
+# Bản NGẮN cho finetune: system prompt lặp lại ở MỌI ví dụ nên mỗi token dư đều nhân
+# lên theo số mẫu (~120 -> ~35 token). Khi đã finetune, model học nhãn từ dữ liệu nên
+# không cần định nghĩa dài. Dùng cho cả train VÀ inference (phải KHỚP nhau).
+SYSTEM_PROMPT_SHORT = (
+    "Gán nhãn ngữ cảnh cho khái niệm y tế trong «». Chọn 0-3 nhãn: "
+    "isNegated (phủ định), isHistorical (tiền sử), isFamily (của người nhà). "
+    'Chỉ in mảng JSON, vd ["isNegated"] hoặc [].'
+)
+
 
 def context_window(text: str, concept: Concept, before: int = 160, after: int = 60) -> str:
     """Ngữ cảnh quanh mention: giới hạn trong DÒNG chứa nó (không rò sang mục khác),
@@ -84,16 +93,19 @@ def target_json(concept: Concept) -> str:
     return json.dumps(gold, ensure_ascii=False)
 
 
-def build_examples(labeled: list[tuple[str, list[Concept]]]) -> list[dict]:
+def build_examples(labeled: list[tuple[str, list[Concept]]],
+                   system: str = SYSTEM_PROMPT) -> list[dict]:
     """Từ train (text, concepts) -> [{system, prompt, target, type}] cho QLoRA.
-    Chỉ lấy concept thuộc TYPES_WITH_ASSERTIONS."""
+    Chỉ lấy concept thuộc TYPES_WITH_ASSERTIONS.
+    `system`: dùng SYSTEM_PROMPT_SHORT khi finetune để tiết kiệm token (nhớ dùng
+    ĐÚNG prompt đó lúc inference: LLMAsserter(system_prompt=...))."""
     out: list[dict] = []
     for text, concepts in labeled:
         for c in concepts:
             if c.type not in TYPES_WITH_ASSERTIONS:
                 continue
             out.append({
-                "system": SYSTEM_PROMPT,
+                "system": system,
                 "prompt": build_prompt(text, c),
                 "target": target_json(c),
                 "type": c.type,
@@ -108,7 +120,7 @@ class LLMAsserter:
     """
 
     def __init__(self, model, tokenizer, device=None, max_new_tokens: int = 16,
-                 system_prompt: str = SYSTEM_PROMPT):
+                 system_prompt: str = SYSTEM_PROMPT, batch_size: int = 16):
         import torch
 
         self.model = model
@@ -117,6 +129,7 @@ class LLMAsserter:
         self.model.eval()
         self.max_new_tokens = max_new_tokens
         self.system_prompt = system_prompt
+        self.batch_size = batch_size   # >1: generate theo batch, nhanh hơn nhiều lần
 
     def _generate(self, user_prompt: str) -> str:
         from ..llm_util import chat_generate
@@ -131,6 +144,28 @@ class LLMAsserter:
         return parse_output(self._generate(build_prompt(text, concept)))
 
     def annotate(self, text: str, concepts: list[Concept]) -> list[Concept]:
+        """Gán assertions cho mọi concept của 1 văn bản.
+
+        Gom các concept cần hỏi thành batch (mặc định 16) rồi generate 1 lượt —
+        nhanh hơn nhiều so với gọi lần lượt. batch_size=1 để về hành vi cũ.
+        """
+        from ..llm_util import chat_generate_batch
+
+        todo = [c for c in concepts if c.type in TYPES_WITH_ASSERTIONS]
         for c in concepts:
-            c.assertions = self.infer_assertions(text, c)
+            if c.type not in TYPES_WITH_ASSERTIONS:
+                c.assertions = []
+
+        if self.batch_size <= 1:
+            for c in todo:
+                c.assertions = parse_output(self._generate(build_prompt(text, c)))
+            return concepts
+
+        for i in range(0, len(todo), self.batch_size):
+            chunk = todo[i:i + self.batch_size]
+            msgs = [[{"role": "system", "content": self.system_prompt},
+                     {"role": "user", "content": build_prompt(text, c)}] for c in chunk]
+            outs = chat_generate_batch(self.model, self.tokenizer, msgs, self.max_new_tokens)
+            for c, o in zip(chunk, outs):
+                c.assertions = parse_output(o)
         return concepts
