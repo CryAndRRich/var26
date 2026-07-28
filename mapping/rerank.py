@@ -52,15 +52,21 @@ def parse_output(s: str, valid_codes: set[str]) -> str | None:
     return None
 
 
-def build_gate(labeled: list[tuple[str, list[Concept]]], min_ratio: float = 0.15) -> dict:
+def build_gate(labeled: list[list[Concept]], min_ratio: float = 0.15) -> dict:
     """Học prior GATE từ train: với mỗi (type, mention_chuẩn_hoá) tỉ lệ CÓ mã;
     và base-rate theo type. Trả dict để `RetrievalRerankMapper` lọc sớm.
-    min_ratio thấp (0.15) vì đây là prior "đáng xét", quyết định cuối để LLM chọn NONE."""
+    min_ratio thấp (0.15) vì đây là prior "đáng xét", quyết định cuối để LLM chọn NONE.
+
+    `labeled`: list các list[Concept] — CÙNG convention với `LookupMapper.fit`
+    (gọi: build_gate([data[i][1] for i in train_ids])). Cũng nhận [(text, concepts)]
+    để không vỡ nếu caller truyền kiểu cũ."""
     seen: dict[tuple[str, str], int] = defaultdict(int)
     coded: dict[tuple[str, str], int] = defaultdict(int)
     seen_t: dict[str, int] = defaultdict(int)
     coded_t: dict[str, int] = defaultdict(int)
-    for _text, concepts in labeled:
+    for item in labeled:
+        # chấp nhận cả list[Concept] (chuẩn) và (text, list[Concept]) (kiểu cũ)
+        concepts = item[1] if (isinstance(item, tuple) and len(item) == 2) else item
         for c in concepts:
             if c.type not in TYPES_WITH_CANDIDATES:
                 continue
@@ -85,15 +91,11 @@ class LLMReranker:
         self.system_prompt = system_prompt
 
     def _generate(self, user_prompt: str) -> str:
-        import torch
+        from ..llm_util import chat_generate
 
         msgs = [{"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": user_prompt}]
-        ids = self.tokenizer.apply_chat_template(
-            msgs, add_generation_prompt=True, return_tensors="pt").to(self.model.device)
-        with torch.no_grad():
-            gen = self.model.generate(ids, max_new_tokens=self.max_new_tokens, do_sample=False)
-        return self.tokenizer.decode(gen[0][ids.shape[1]:], skip_special_tokens=True)
+        return chat_generate(self.model, self.tokenizer, msgs, self.max_new_tokens)
 
     def rerank(self, concept: Concept, candidates: list[tuple[str, str]], context: str = "") -> str | None:
         if not candidates:

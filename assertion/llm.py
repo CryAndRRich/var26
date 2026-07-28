@@ -119,15 +119,11 @@ class LLMAsserter:
         self.system_prompt = system_prompt
 
     def _generate(self, user_prompt: str) -> str:
-        import torch
+        from ..llm_util import chat_generate
 
         msgs = [{"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": user_prompt}]
-        ids = self.tokenizer.apply_chat_template(
-            msgs, add_generation_prompt=True, return_tensors="pt").to(self.model.device)
-        with torch.no_grad():
-            gen = self.model.generate(ids, max_new_tokens=self.max_new_tokens, do_sample=False)
-        return self.tokenizer.decode(gen[0][ids.shape[1]:], skip_special_tokens=True)
+        return chat_generate(self.model, self.tokenizer, msgs, self.max_new_tokens)
 
     def infer_assertions(self, text: str, concept: Concept) -> list[str]:
         if concept.type not in TYPES_WITH_ASSERTIONS:
