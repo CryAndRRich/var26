@@ -147,11 +147,15 @@ class GatedMapper:
         return self.select_codes(text, concept)
 
 
-def _line_of(text: str, concept: Concept, limit: int = 200) -> str:
+def line_of(text: str, concept: Concept, limit: int = 200) -> str:
+    """Dòng chứa mention (cắt `limit` ký tự) — dùng làm ngữ cảnh cho LLM rerank."""
     s, e = concept.position
     ls = text.rfind("\n", 0, s) + 1
     le = text.find("\n", e)
     return text[ls:(le if le != -1 else len(text))].strip()[:limit]
+
+
+_line_of = line_of   # tương thích ngược
 
 
 def tune_gate_threshold(dev_labeled, gate: "EncoderGate", mapper: "GatedMapper",
