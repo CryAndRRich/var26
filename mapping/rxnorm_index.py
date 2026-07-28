@@ -14,6 +14,28 @@ from pathlib import Path
 
 from .icd_index import normalize
 
+# Viết tắt lâm sàng hay gặp trong bệnh án -> tên chuẩn. ĐO THỰC TẾ: BM25 trượt các mention
+# như "asa 325mg" (ra acetaminophen/ferrous sulfate) vì "asa" không có trong tên RxNorm.
+DRUG_ALIASES = {
+    "asa": "aspirin",
+    "apap": "acetaminophen",
+    "hctz": "hydrochlorothiazide",
+    "mgso4": "magnesium sulfate",
+    "kcl": "potassium chloride",
+    "nacl": "sodium chloride",
+    "ntg": "nitroglycerin",
+    "asa/dipyridamole": "aspirin dipyridamole",
+    "abx": "antibiotic",
+    "insulin nph": "insulin isophane human",
+}
+
+
+def expand_mention(mention: str) -> str:
+    """Thay viết tắt bằng tên chuẩn (giữ nguyên phần liều — mã gold ở mức CÓ LIỀU,
+    vd 617317 = 'atorvastatin 20 MG [Lipitor]', nên KHÔNG được bỏ liều)."""
+    toks = normalize(mention).split()
+    return " ".join(DRUG_ALIASES.get(t, t) for t in toks)
+
 
 @dataclass
 class RxNormEntry:
@@ -46,7 +68,12 @@ class RxNormIndex:
         return cls(entries)
 
     def exact(self, mention: str) -> list[str]:
-        return self._by_norm.get(normalize(mention), [])
+        """Khớp chính xác; nếu trượt thì thử lại sau khi mở viết tắt (asa->aspirin...)."""
+        hit = self._by_norm.get(normalize(mention), [])
+        if hit:
+            return hit
+        exp = expand_mention(mention)
+        return self._by_norm.get(exp, []) if exp != normalize(mention) else []
 
     def __len__(self) -> int:
         return len(self.entries)

@@ -57,11 +57,15 @@ def featurize(examples: list[dict], tok, max_length: int = 160) -> list[dict]:
 
 
 def tune_thresholds(probs, gold, grid=None) -> list[float]:
-    """Chọn threshold TỪNG NHÃN để tối đa F1 của nhãn đó trên dev.
+    """[KHÔNG DÙNG ĐỂ CHỌN NGƯỠNG CUỐI] Threshold tối đa F1 TỪNG NHÃN.
 
-    probs/gold: ma trận (N, 3). Vì đoán THỪA assertion làm mất điểm Jaccard của
-    concept đó, threshold thường cần > 0.5 (precision-first) — để dữ liệu tự quyết.
-    Nhãn không có ca dương nào trong dev -> giữ 0.5 (không tune được).
+    ⚠️ Đo thực tế (EXP3b) cho thấy tối đa F1 làm ĐIỂM THI GIẢM: F1 đẩy ngưỡng xuống
+    (0.15/0.40) để lấy recall, nhưng metric là **Jaccard theo concept** — đoán thừa 1
+    assertion trên concept đáng-lẽ-rỗng làm sample đó 0 điểm. Kết quả: value 0.568 (tuned)
+    < 0.589 (@0.5). Dùng `tune_thresholds_by_score` để tối ưu ĐÚNG hàm mục tiêu.
+    Giữ hàm này chỉ để phân tích P/R/F1 từng nhãn.
+
+    probs/gold: ma trận (N, 3). Nhãn không có ca dương trong dev -> giữ 0.5.
     """
     grid = grid if grid is not None else [i / 20 for i in range(2, 19)]  # 0.10..0.90
     out: list[float] = []
@@ -83,6 +87,77 @@ def tune_thresholds(probs, gold, grid=None) -> list[float]:
                 best_f1, best_t = f1, t
         out.append(best_t)
     return out
+
+
+def tune_thresholds_by_score(dev_labeled, asserter, key_mode: str = "value",
+                             grid=None, passes: int = 4, start=None, verbose: bool = True):
+    """Chọn threshold để tối đa CHÍNH `assertions_score` (Jaccard) trên dev.
+
+    Đây là cách đúng: metric phạt nặng đoán thừa (concept đáng-lẽ-rỗng mà gán nhãn -> 0
+    điểm sample đó), nên tối ưu F1 từng nhãn cho kết quả tệ hơn (xem `tune_thresholds`).
+
+    Dùng coordinate ascent (quét lần lượt từng nhãn, lặp `passes` lượt) — rẻ hơn quét
+    toàn bộ tổ hợp mà thực tế đủ tốt. Xác suất được TÍNH MỘT LẦN rồi tái dùng cho mọi
+    ngưỡng nên vòng tune không cần chạy lại model.
+
+    dev_labeled: [(text, gold_concepts)] — thường là DEV, KHÔNG phải tập báo cáo cuối.
+    Trả (thresholds, best_score).
+    """
+    import copy
+
+    # Chỉ cần THÀNH PHẦN assertion — gọi score_dataset đầy đủ sẽ tính cả text score (WER,
+    # O(n²) mỗi file) khiến vòng tune chậm gấp hàng chục lần một cách vô ích.
+    from ..eval.metrics import assertions_score_sample
+
+    grid = grid if grid is not None else [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+
+    # 1) tính prob 1 lần cho toàn dev
+    cached = []
+    for text, gold in dev_labeled:
+        todo = [c for c in gold if c.type in TYPES_WITH_ASSERTIONS]
+        probs = asserter.predict_proba([build_input(text, c) for c in todo])
+        cached.append((gold, todo, probs))
+
+    id_of = {}   # id(concept) -> chỉ số trong todo, để gán nhanh
+    for gold, todo, _ in cached:
+        for k, c in enumerate(todo):
+            id_of[id(c)] = k
+
+    def evaluate(th: list[float]) -> float:
+        total = 0.0
+        for gold, todo, probs in cached:
+            pred = []
+            for c in gold:
+                c2 = copy.copy(c)
+                if c.type in TYPES_WITH_ASSERTIONS:
+                    p = probs[id_of[id(c)]]
+                    c2.assertions = [a for j, a in enumerate(LABELS) if p[j] >= th[j]]
+                else:
+                    c2.assertions = []
+                pred.append(c2)
+            total += assertions_score_sample(gold, pred, key_mode)
+        return total / len(cached) if cached else 0.0
+
+    th = list(start) if start is not None else [0.5] * len(LABELS)
+    best = evaluate(th)
+    if verbose:
+        print(f"  khởi đầu th={th} -> {key_mode} assert={best:.4f}")
+    for p in range(passes):
+        improved = False
+        for j in range(len(LABELS)):
+            for t in grid:
+                if t == th[j]:
+                    continue
+                cand = list(th)
+                cand[j] = t
+                s = evaluate(cand)
+                if s > best + 1e-9:
+                    best, th, improved = s, cand, True
+        if verbose:
+            print(f"  pass {p + 1}: th={th} -> {best:.4f}")
+        if not improved:
+            break
+    return th, best
 
 
 class EncoderAsserter:
