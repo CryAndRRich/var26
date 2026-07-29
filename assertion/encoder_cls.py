@@ -5,8 +5,10 @@ Bài toán assertion thực chất là phân loại 3 nhãn NHỊ PHÂN ĐỘC L
 văn bản. Encoder train ~5-10' (vs 1-2h QLoRA 7B) và inference nhanh hơn hàng chục lần
 — quan trọng khi submit: 100 file × ~154 concept ≈ 15.4k lần gán.
 
-Dùng CHUNG cách đánh dấu mention («») với `assertion/llm.py::context_window` để hai
-phương án so sánh công bằng trên cùng input.
+Input dùng CHUNG với gate-encoder qua `var26/text/context.py`:
+`"{type} | {section path} | {ngữ cảnh có «mention»}"`. Bản EXP3b cũ chỉ có
+`"{type} | {ngữ cảnh trong 1 dòng}"` — trên layout gạch đầu dòng của tập test thì cửa sổ
+1 dòng gần như CHỈ chứa mention, model không còn gì để suy luận (xem var26/text/layout.py).
 
 Phần ở đây CPU-safe (chỉ tokenizer/numpy); vòng train đặt ở notebooks/ (Kaggle GPU).
 
@@ -17,16 +19,27 @@ model. `EncoderAsserter(rule_labels=('isFamily',))` cho phép lấy nhãn đó t
 from __future__ import annotations
 
 from ..io.schema import ASSERTIONS, Concept, TYPES_WITH_ASSERTIONS
-from .llm import context_window
+from ..text.context import build_input as _ctx_input
+from ..text.context import build_inputs as _ctx_inputs
 
 # Thứ tự nhãn CỐ ĐỊNH = thứ tự cột logits/threshold. Không đổi thứ tự này.
 LABELS: tuple[str, ...] = ASSERTIONS
 LABEL2IDX = {a: i for i, a in enumerate(LABELS)}
 
 
-def build_input(text: str, concept: Concept) -> str:
-    """Input cho classifier: kèm type (giúp phân biệt ngữ cảnh) + ngữ cảnh đã đánh dấu «»."""
-    return f"{concept.type} | {context_window(text, concept)}"
+def build_input(text: str, concept: Concept, **kw) -> str:
+    """Input cho classifier: `type | section path | ngữ cảnh có «mention»`.
+
+    Section path + ngữ cảnh vượt dòng là bản SỬA cho layout tập test — xem
+    `var26/text/context.py`. Truyền `section=False, lines_before=0, lines_after=0`
+    để dựng lại đúng input của EXP3b (dùng khi A/B).
+    """
+    return _ctx_input(text, concept, **kw)
+
+
+def build_inputs(text: str, concepts: list[Concept], **kw) -> list[str]:
+    """Như `build_input` cho nhiều concept cùng văn bản (phân tích heading 1 lần)."""
+    return _ctx_inputs(text, concepts, **kw)
 
 
 def multi_hot(concept: Concept) -> list[float]:
@@ -34,18 +47,17 @@ def multi_hot(concept: Concept) -> list[float]:
     return [1.0 if a in got else 0.0 for a in LABELS]
 
 
-def build_examples(labeled: list[tuple[str, list[Concept]]]) -> list[dict]:
+def build_examples(labeled: list[tuple[str, list[Concept]]], **kw) -> list[dict]:
     """(text, concepts) -> [{'text', 'labels'(3 float), 'type'}] cho concept có assertions."""
     out: list[dict] = []
     for text, concepts in labeled:
-        for c in concepts:
-            if c.type not in TYPES_WITH_ASSERTIONS:
-                continue
-            out.append({"text": build_input(text, c), "labels": multi_hot(c), "type": c.type})
+        todo = [c for c in concepts if c.type in TYPES_WITH_ASSERTIONS]
+        for c, inp in zip(todo, build_inputs(text, todo, **kw)):
+            out.append({"text": inp, "labels": multi_hot(c), "type": c.type})
     return out
 
 
-def featurize(examples: list[dict], tok, max_length: int = 160) -> list[dict]:
+def featurize(examples: list[dict], tok, max_length: int = 224) -> list[dict]:
     """Tokenize -> feature cho HF Trainer (multi-label: labels là vector float)."""
     feats: list[dict] = []
     for e in examples:
@@ -89,12 +101,24 @@ def tune_thresholds(probs, gold, grid=None) -> list[float]:
     return out
 
 
-def tune_thresholds_by_score(dev_labeled, asserter, key_mode: str = "value",
+def tune_thresholds_by_score(dev_labeled, asserter, key_mode: str = "concept_first",
                              grid=None, passes: int = 4, start=None, verbose: bool = True):
     """Chọn threshold để tối đa CHÍNH `assertions_score` (Jaccard) trên dev.
 
     Đây là cách đúng: metric phạt nặng đoán thừa (concept đáng-lẽ-rỗng mà gán nhãn -> 0
     điểm sample đó), nên tối ưu F1 từng nhãn cho kết quả tệ hơn (xem `tune_thresholds`).
+
+    `key_mode`:
+      - **"concept_first" (MẶC ĐỊNH)**: 2/3 "concept" + 1/3 "value". Đề (mục 5a) nói sai
+        `type` làm khái niệm bị "tính 2 lần, mỗi lần 0 điểm" — chỉ đúng nếu scorer gióng
+        theo từng khái niệm, tức nghiêng về "concept". Thêm nữa bất đối xứng đo được:
+        tối ưu "concept" gần như không hại "value", còn tối ưu "value" thì phá "concept".
+      - "balanced": trung bình đều 2 mode.
+      - "value" / "concept": tối ưu riêng một cách diễn giải.
+    ⚠️ ĐO THỰC TẾ (EXP5): tối ưu riêng `value` hạ ngưỡng 0.5 -> 0.3/0.5/0.3, làm value
+    0.589 -> 0.620 NHƯNG concept 0.414 -> 0.158 (over-fire assertion gấp 2× tỉ lệ train).
+    Vì **scorer chính thức chưa công bố**, tối ưu riêng một mode là đánh cược -> mặc định
+    "concept_first".
 
     Dùng coordinate ascent (quét lần lượt từng nhãn, lặp `passes` lượt) — rẻ hơn quét
     toàn bộ tổ hợp mà thực tế đủ tốt. Xác suất được TÍNH MỘT LẦN rồi tái dùng cho mọi
@@ -115,7 +139,7 @@ def tune_thresholds_by_score(dev_labeled, asserter, key_mode: str = "value",
     cached = []
     for text, gold in dev_labeled:
         todo = [c for c in gold if c.type in TYPES_WITH_ASSERTIONS]
-        probs = asserter.predict_proba([build_input(text, c) for c in todo])
+        probs = asserter.predict_proba(build_inputs(text, todo, **asserter.ctx_kw))
         cached.append((gold, todo, probs))
 
     id_of = {}   # id(concept) -> chỉ số trong todo, để gán nhanh
@@ -123,8 +147,17 @@ def tune_thresholds_by_score(dev_labeled, asserter, key_mode: str = "value",
         for k, c in enumerate(todo):
             id_of[id(c)] = k
 
+    from ..eval.metrics import CONCEPT_FIRST_W
+    if key_mode == "concept_first":
+        weights = dict(CONCEPT_FIRST_W)
+    elif key_mode == "balanced":
+        weights = {"value": 0.5, "concept": 0.5}
+    else:
+        weights = {key_mode: 1.0}
+    modes = tuple(weights)
+
     def evaluate(th: list[float]) -> float:
-        total = 0.0
+        sums = {m: 0.0 for m in modes}
         for gold, todo, probs in cached:
             pred = []
             for c in gold:
@@ -135,8 +168,11 @@ def tune_thresholds_by_score(dev_labeled, asserter, key_mode: str = "value",
                 else:
                     c2.assertions = []
                 pred.append(c2)
-            total += assertions_score_sample(gold, pred, key_mode)
-        return total / len(cached) if cached else 0.0
+            for m in modes:
+                sums[m] += assertions_score_sample(gold, pred, m)
+        if not cached:
+            return 0.0
+        return sum(weights[m] * sums[m] for m in modes) / len(cached)
 
     th = list(start) if start is not None else [0.5] * len(LABELS)
     best = evaluate(th)
@@ -168,13 +204,18 @@ class EncoderAsserter:
     """
 
     def __init__(self, model, tokenizer, thresholds=None, batch_size: int = 64,
-                 max_length: int = 160, rule_labels: tuple[str, ...] = ()):
+                 max_length: int = 224, rule_labels: tuple[str, ...] = (),
+                 ctx_kw: dict | None = None):
         self.model = model
         self.tokenizer = tokenizer
         self.thresholds = list(thresholds) if thresholds is not None else [0.5] * len(LABELS)
         self.batch_size = batch_size
+        # max_length 160 -> 224: input giờ có thêm section path + vài dòng ngữ cảnh.
         self.max_length = max_length
         self.rule_labels = tuple(rule_labels)
+        # PHẢI khớp cấu hình dùng lúc train (nếu train bằng input kiểu EXP3b thì
+        # truyền ctx_kw=dict(section=False, lines_before=0, lines_after=0)).
+        self.ctx_kw = dict(ctx_kw or {})
         self.model.eval()
 
     def predict_proba(self, inputs: list[str]):
@@ -203,7 +244,7 @@ class EncoderAsserter:
             if c.type not in TYPES_WITH_ASSERTIONS:
                 c.assertions = []
 
-        probs = self.predict_proba([build_input(text, c) for c in todo])
+        probs = self.predict_proba(build_inputs(text, todo, **self.ctx_kw))
         for c, p in zip(todo, probs):
             got = [a for j, a in enumerate(LABELS)
                    if a not in self.rule_labels and p[j] >= self.thresholds[j]]

@@ -45,14 +45,42 @@ SYSTEM_PROMPT_SHORT = (
 )
 
 
-def context_window(text: str, concept: Concept, before: int = 160, after: int = 60) -> str:
-    """Ngữ cảnh quanh mention: giới hạn trong DÒNG chứa nó (không rò sang mục khác),
-    cắt cửa sổ ký tự để prompt gọn, và đánh dấu mention bằng «»."""
+def _expand_lines(text: str, pos: int, n: int, backward: bool) -> int:
+    """Lùi/tiến thêm `n` ranh giới dòng tính từ đầu/cuối dòng chứa `pos`."""
+    if backward:
+        i = text.rfind("\n", 0, pos) + 1
+        for _ in range(n):
+            if i == 0:
+                break
+            i = text.rfind("\n", 0, i - 1) + 1
+        return i
+    i = text.find("\n", pos)
+    if i < 0:
+        return len(text)
+    for _ in range(n):
+        j = text.find("\n", i + 1)
+        if j < 0:
+            return len(text)
+        i = j
+    return i
+
+
+def context_window(text: str, concept: Concept, before: int = 160, after: int = 60,
+                   lines_before: int = 0, lines_after: int = 0) -> str:
+    """Ngữ cảnh quanh mention, đánh dấu mention bằng «».
+
+    `lines_before/lines_after` = 0 -> giữ nguyên hành vi cũ: KHÔNG rò ra ngoài DÒNG
+    chứa mention.
+
+    ⚠️ Vì sao cần cho phép >0: trong tập test, 32% ký tự nằm trong dòng gạch đầu dòng
+    và mention thường CHIẾM TRỌN dòng ("- tăng huyết áp"). Khi đó cửa sổ giới hạn theo
+    dòng trả về gần như chỉ có chính mention -> model assertion/gate KHÔNG có ngữ cảnh
+    nào để suy luận. Train là văn xuôi nên lỗi này không lộ ra khi đo nội bộ.
+    Xem `var26/text/layout.py` để biết số đo đầy đủ.
+    """
     s, e = concept.position
-    line_start = text.rfind("\n", 0, s) + 1
-    line_end = text.find("\n", e)
-    if line_end == -1:
-        line_end = len(text)
+    line_start = _expand_lines(text, s, lines_before, backward=True)
+    line_end = _expand_lines(text, e, lines_after, backward=False)
     ws = max(line_start, s - before)
     we = min(line_end, e + after)
     left, mid, right = text[ws:s], text[s:e], text[e:we]

@@ -79,10 +79,17 @@ def _align_key(c: Concept) -> tuple:
     return (c.position[0], c.position[1], c.type)
 
 
-# key_mode: cách định nghĩa "tập" cấp sample (định nghĩa chính thức còn nhập nhằng):
+# key_mode: cách định nghĩa "tập" cấp sample (mã chấm chính thức chưa công bố):
 #   "value"   (A): tập GIÁ TRỊ thô (code/assertion) — đọc theo nghĩa đen "set" của đề.
 #   "concept" (B): tập (concept_key, giá trị) — gắn giá trị với đúng khái niệm.
-# Ta báo cáo cả hai để trung thực; xem docs/results.
+#
+# BẰNG CHỨNG TỪ ĐỀ nghiêng về (B): mục 5a ghi "đoán đúng phần `text` nhưng sai `type` thì
+# khái niệm bị TÍNH 2 LẦN và mỗi lần đều 0 điểm với cả 3 metric". Câu này chỉ có nghĩa nếu
+# scorer GIÓNG prediction với gold theo từng khái niệm — tức là (B). Với (A) (túi giá trị
+# cấp file) thì sai `type` không tạo ra hiện tượng "tính 2 lần" nào.
+# ⟹ Khi chọn ngưỡng, ưu tiên "concept"; vẫn báo cáo cả hai vì chưa có scorer chính thức.
+# Xem thêm docs/results/2026-07-29_domain_shift.md.
+CONCEPT_FIRST_W = {"concept": 2 / 3, "value": 1 / 3}
 
 
 def _item_counter(concepts, types, field, key_mode):

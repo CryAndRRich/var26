@@ -16,29 +16,34 @@ Phần ở đây CPU-safe; vòng train đặt ở notebooks/ (Kaggle GPU).
 """
 from __future__ import annotations
 
-from ..assertion.llm import context_window  # dùng CHUNG cách đánh dấu «mention» với EXP3b
 from ..io.schema import Concept, TYPES_WITH_CANDIDATES
+# Dùng CHUNG bộ dựng ngữ cảnh với assertion-encoder (type | section path | «mention»)
+# để hai module so được với nhau và cùng thấy heading — xem var26/text/context.py.
+from ..text.context import build_input as _ctx_input
+from ..text.context import build_inputs as _ctx_inputs
 
 
-def build_input(text: str, concept: Concept) -> str:
-    """Input cho gate: type + ngữ cảnh đã đánh dấu «mention» (giống EXP3b để so được)."""
-    return f"{concept.type} | {context_window(text, concept)}"
+def build_input(text: str, concept: Concept, **kw) -> str:
+    """Input cho gate: `type | section path | ngữ cảnh có «mention»` (giống EXP3b)."""
+    return _ctx_input(text, concept, **kw)
 
 
-def build_examples(labeled: list[tuple[str, list[Concept]]]) -> list[dict]:
+def build_inputs(text: str, concepts: list[Concept], **kw) -> list[str]:
+    """Như `build_input` cho nhiều concept cùng văn bản (phân tích heading 1 lần)."""
+    return _ctx_inputs(text, concepts, **kw)
+
+
+def build_examples(labeled: list[tuple[str, list[Concept]]], **kw) -> list[dict]:
     """(text, concepts) -> [{'text', 'label'(0/1), 'type'}]; label=1 nếu gold CÓ mã."""
     out: list[dict] = []
     for text, concepts in labeled:
-        for c in concepts:
-            if c.type not in TYPES_WITH_CANDIDATES:
-                continue
-            out.append({"text": build_input(text, c),
-                        "label": 1 if c.candidates else 0,
-                        "type": c.type})
+        todo = [c for c in concepts if c.type in TYPES_WITH_CANDIDATES]
+        for c, inp in zip(todo, build_inputs(text, todo, **kw)):
+            out.append({"text": inp, "label": 1 if c.candidates else 0, "type": c.type})
     return out
 
 
-def featurize(examples: list[dict], tok, max_length: int = 160) -> list[dict]:
+def featurize(examples: list[dict], tok, max_length: int = 224) -> list[dict]:
     """Tokenize -> feature cho HF Trainer (num_labels=2, CrossEntropy, label int)."""
     feats: list[dict] = []
     for e in examples:
@@ -53,12 +58,16 @@ class EncoderGate:
     """P(concept này ĐƯỢC gán mã). Model 2 lớp; trả softmax của lớp 1."""
 
     def __init__(self, model, tokenizer, threshold: float = 0.5,
-                 batch_size: int = 64, max_length: int = 160):
+                 batch_size: int = 64, max_length: int = 224,
+                 ctx_kw: dict | None = None):
         self.model = model
         self.tokenizer = tokenizer
         self.threshold = threshold
         self.batch_size = batch_size
+        # 160 -> 224: input giờ có thêm section path + vài dòng ngữ cảnh.
         self.max_length = max_length
+        # PHẢI khớp cấu hình dùng lúc train.
+        self.ctx_kw = dict(ctx_kw or {})
         self.model.eval()
 
     def predict_proba(self, texts: list[str]) -> list[float]:
@@ -80,13 +89,13 @@ class EncoderGate:
     def proba_for(self, text: str, concepts: list[Concept]) -> dict[int, float]:
         """{id(concept): prob} cho các concept thuộc loại có candidates."""
         todo = [c for c in concepts if c.type in TYPES_WITH_CANDIDATES]
-        probs = self.predict_proba([build_input(text, c) for c in todo])
+        probs = self.predict_proba(build_inputs(text, todo, **self.ctx_kw))
         return {id(c): p for c, p in zip(todo, probs)}
 
     def passes(self, text: str, concept: Concept) -> bool:
         if concept.type not in TYPES_WITH_CANDIDATES:
             return False
-        return self.predict_proba([build_input(text, concept)])[0] >= self.threshold
+        return self.predict_proba([build_input(text, concept, **self.ctx_kw)])[0] >= self.threshold
 
 
 class GatedMapper:
@@ -159,19 +168,34 @@ _line_of = line_of   # tương thích ngược
 
 
 def tune_gate_threshold(dev_labeled, gate: "EncoderGate", mapper: "GatedMapper",
-                        key_mode: str = "value", grid=None, verbose: bool = True):
+                        key_mode: str = "concept_first", grid=None, verbose: bool = True):
     """Chọn ngưỡng gate tối đa CHÍNH `candidates_score` trên dev.
 
     Hiệu quả: prob của gate và mã chọn được TÍNH MỘT LẦN cho mỗi concept, sau đó chỉ thay
     ngưỡng ⟹ quét cả grid không cần chạy lại model/retrieval (kể cả khi có LLM rerank).
     Lưu ý dùng `assertions`-style: gọi `candidates_score_sample` trực tiếp để bỏ text-score (WER).
+
+    `key_mode="concept_first"` (mặc định) = 2/3 "concept" + 1/3 "value". Đề (mục 5a) mô tả
+    sai `type` bị "tính 2 lần, mỗi lần 0 điểm" — chỉ đúng nếu scorer gióng theo từng khái
+    niệm ⟹ nghiêng "concept". Tối ưu riêng một mode là đánh cược (bài học EXP5).
+
+    Grid CÓ 0.0 — nghĩa là "không gate". Ở EXP4b grid bắt đầu từ 0.05 nên với biến thể
+    `gate + lookup` tuner chọn đúng biên dưới, dấu hiệu tối ưu thật nằm ngoài grid.
     Trả (threshold, best_score).
     """
     import copy
 
     from ..eval.metrics import candidates_score_sample
 
-    grid = grid if grid is not None else [i / 20 for i in range(1, 20)]  # 0.05..0.95
+    grid = grid if grid is not None else [0.0] + [i / 20 for i in range(1, 20)]
+    from ..eval.metrics import CONCEPT_FIRST_W
+    if key_mode == "concept_first":
+        weights = dict(CONCEPT_FIRST_W)
+    elif key_mode == "balanced":
+        weights = {"value": 0.5, "concept": 0.5}
+    else:
+        weights = {key_mode: 1.0}
+    modes = tuple(weights)
 
     cached = []   # (gold, {id: (prob, codes)})
     for text, gold in dev_labeled:
@@ -183,21 +207,24 @@ def tune_gate_threshold(dev_labeled, gate: "EncoderGate", mapper: "GatedMapper",
         cached.append((gold, info))
 
     def evaluate(th: float) -> float:
-        num = den = 0.0
-        for gold, info in cached:
-            pred = []
-            for c in gold:
-                c2 = copy.copy(c)
-                if c.type in TYPES_WITH_CANDIDATES:
-                    p, codes = info[id(c)]
-                    c2.candidates = codes if p >= th else []
-                else:
-                    c2.candidates = []
-                pred.append(c2)
-            j, w = candidates_score_sample(gold, pred, key_mode)
-            num += j * w
-            den += w
-        return num / den if den else 0.0
+        total = 0.0
+        for m in modes:
+            num = den = 0.0
+            for gold, info in cached:
+                pred = []
+                for c in gold:
+                    c2 = copy.copy(c)
+                    if c.type in TYPES_WITH_CANDIDATES:
+                        p, codes = info[id(c)]
+                        c2.candidates = codes if p >= th else []
+                    else:
+                        c2.candidates = []
+                    pred.append(c2)
+                j, w = candidates_score_sample(gold, pred, m)
+                num += j * w
+                den += w
+            total += weights[m] * (num / den if den else 0.0)
+        return total
 
     best_t, best_s = grid[0], -1.0
     for t in grid:
