@@ -133,7 +133,11 @@ def tune_thresholds_by_score(dev_labeled, asserter, key_mode: str = "concept_fir
     # O(n²) mỗi file) khiến vòng tune chậm gấp hàng chục lần một cách vô ích.
     from ..eval.metrics import assertions_score_sample
 
-    grid = grid if grid is not None else [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+    # Grid PHẢI phủ cả vùng thấp: ở EXP6 lượt 1, grid cũ (bắt đầu 0.3) làm tuner chọn
+    # đúng BIÊN DƯỚI 0.3 cho isHistorical — dấu hiệu điển hình rằng tối ưu thật nằm NGOÀI
+    # grid (đúng khiếm khuyết đã gặp ở grid gate của EXP4b).
+    grid = grid if grid is not None else [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5,
+                                         0.6, 0.7, 0.8, 0.9, 0.95]
 
     # 1) tính prob 1 lần cho toàn dev
     cached = []
